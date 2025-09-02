@@ -6,9 +6,9 @@ import sys, time, logging, signal, ipaddress, subprocess, urllib.parse
 from urllib.parse import urlparse, urlunparse
 from typing import Dict, List, Optional, Tuple, Set
 
-from twisted.internet import reactor, task, defer, ssl as tssl, endpoints
+from twisted.internet import reactor, task, defer, ssl as tssl
 from twisted.internet.threads import deferToThread
-from twisted.internet.protocol import Protocol, Factory
+from twisted.internet.protocol import Protocol, Factory, ClientFactory
 from twisted.web.client import Agent, BrowserLikePolicyForHTTPS
 from twisted.web.http_headers import Headers
 from twisted.internet.defer import Deferred
@@ -17,8 +17,8 @@ from twisted.web.server import Site
 from twisted.web.wsgi import WSGIResource
 from twisted.web.client import FileBodyProducer
 from twisted.internet.ssl import ContextFactory
-from twisted.protocols.tls import TLSMemoryBIOProtocol
-
+from twisted.protocols.tls import TLSMemoryBIOProtocol, TLSMemoryBIOFactory
+from twisted.internet.endpoints import TCP4ServerEndpoint
 
 from OpenSSL import SSL, crypto
 from cryptography import x509
@@ -27,7 +27,6 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import datetime
 from collections import OrderedDict
-
 
 import h2.connection
 import h2.events
@@ -43,6 +42,10 @@ import socket
 from urllib.parse import urlparse
 import re
 import zlib
+import logging
+import secrets
+
+logging.basicConfig(level=logging.INFO)
 
 # ---------- Configuration ----------
 LISTEN_PORT = 6666
@@ -96,112 +99,133 @@ PRIVATE_V6_NETS = [
     ipaddress.ip_network("ff00::/8"),            # multicast
 ]
 
+CERT_FILE = "root_ca.pem"
+KEY_FILE = "root_ca.key"
 
-def load_or_create_root_ca() -> tuple[bytes, bytes]:
-    if os.path.exists("root_ca.pem") and os.path.exists("root_ca.key"):
-        with open("root_ca.pem", "rb") as f: cert_pem = f.read()
-        with open("root_ca.key", "rb") as f: key_pem = f.read()
+from OpenSSL import crypto
+import os, time
+
+def load_or_create_root_ca(cert_file="root_ca.pem", key_file="root_ca.key"):
+    if os.path.exists(cert_file) and os.path.exists(key_file):
+        with open(cert_file, "rb") as f:
+            cert_data = f.read()
+        with open(key_file, "rb") as f:
+            key_data = f.read()
+        cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_data)
+        key = crypto.load_privatekey(crypto.FILETYPE_PEM, key_data)
+    else:
+        key = crypto.PKey()
+        key.generate_key(crypto.TYPE_RSA, 4096)
+
+        cert = crypto.X509()
+        cert.set_version(2)
+        cert.set_serial_number(int(time.time()))
+        subj = cert.get_subject()
+        subj.CN = "Bogus ROOT CA"
+        subj.O = "Bogus Org"
+        subj.C = "US"
+        cert.gmtime_adj_notBefore(0)
+        cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)
+        cert.set_issuer(subj)
+        cert.set_pubkey(key)
+
+        cert.add_extensions([
+            crypto.X509Extension(b"basicConstraints", True, b"CA:TRUE, pathlen:1"),
+            crypto.X509Extension(b"keyUsage", True, b"keyCertSign, cRLSign"),
+            crypto.X509Extension(b"subjectKeyIdentifier", False, b"hash", subject=cert),
+        ])
+
+        cert.sign(key, "sha256")
+
+        with open(cert_file, "wb") as f:
+            f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+        with open(key_file, "wb") as f:
+            f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
+
+    return cert, key
+
+
+def load_or_create_intermediate_ca(root_cert, root_key,
+                                   cert_file="intermediate_ca.pem",
+                                   key_file="intermediate_ca.key") -> tuple[bytes, bytes]:
+    if os.path.exists(cert_file) and os.path.exists(key_file):
+        with open(cert_file, "rb") as f:
+            cert_pem = f.read()
+        with open(key_file, "rb") as f:
+            key_pem = f.read()
         return cert_pem, key_pem
 
-    # generate new root
-    key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
-    subject = x509.Name([
-        x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Bogus Root"),
-        x509.NameAttribute(NameOID.COMMON_NAME, u"Bogus Root CA"),
+    key = crypto.PKey()
+    key.generate_key(crypto.TYPE_RSA, 4096)
+
+    cert = crypto.X509()
+    subj = cert.get_subject()
+    subj.C = "US"
+    subj.O = "Bogus Intermediate"
+    subj.CN = "Bogus Intermediate CA"
+
+    cert.set_serial_number(int.from_bytes(os.urandom(16), "big"))
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)
+    cert.set_issuer(root_cert.get_subject())
+    cert.set_pubkey(key)
+
+    exts = [
+        crypto.X509Extension(b"basicConstraints", True, b"CA:TRUE, pathlen:0"),
+        crypto.X509Extension(b"keyUsage", True, b"keyCertSign, cRLSign"),
+        crypto.X509Extension(b"subjectKeyIdentifier", False, b"hash", subject=cert),
+        crypto.X509Extension(b"authorityKeyIdentifier", False, b"keyid:always,issuer", issuer=root_cert),
+    ]
+    cert.add_extensions(exts)
+
+    cert.sign(root_key, "sha256")
+
+    cert_pem = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
+    key_pem = crypto.dump_privatekey(crypto.FILETYPE_PEM, key)
+
+    with open(cert_file, "wb") as f:
+        f.write(cert_pem)
+    with open(key_file, "wb") as f:
+        f.write(key_pem)
+
+    return cert_pem, key_pem
+
+
+def generate_leaf_cert(hostname: str, ca_cert_pem: bytes, ca_key_pem: bytes):
+    # Load CA from PEM
+    ca_cert = crypto.load_certificate(crypto.FILETYPE_PEM, ca_cert_pem)
+    ca_key = crypto.load_privatekey(crypto.FILETYPE_PEM, ca_key_pem)
+
+    key = crypto.PKey()
+    key.generate_key(crypto.TYPE_RSA, 2048)
+
+    cert = crypto.X509()
+    cert.set_version(2)
+    cert.set_serial_number(int.from_bytes(os.urandom(16), "big"))
+
+    subj = cert.get_subject()
+    subj.CN = hostname if len(hostname) <= 64 else "proxy-leaf"
+
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(365 * 24 * 60 * 60)
+    cert.set_issuer(ca_cert.get_subject())
+    cert.set_pubkey(key)
+
+    san = f"DNS:{hostname}".encode("ascii")
+
+    cert.add_extensions([
+        crypto.X509Extension(b"basicConstraints", True, b"CA:FALSE"),
+        crypto.X509Extension(b"keyUsage", True, b"digitalSignature,keyEncipherment"),
+        crypto.X509Extension(b"extendedKeyUsage", True, b"serverAuth"),
+        crypto.X509Extension(b"subjectAltName", False, san),
     ])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=1), critical=True)
-        .sign(key, hashes.SHA256())
+
+    cert.sign(ca_key, "sha256")
+
+    return (
+        crypto.dump_certificate(crypto.FILETYPE_PEM, cert),
+        crypto.dump_privatekey(crypto.FILETYPE_PEM, key),
     )
-
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    key_pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption()
-    )
-
-    with open("root_ca.pem", "wb") as f: f.write(cert_pem)
-    with open("root_ca.key", "wb") as f: f.write(key_pem)
-
-    return cert_pem, key_pem
-
-def load_or_create_intermediate_ca(root_cert_pem: bytes, root_key_pem: bytes) -> tuple[bytes, bytes]:
-    if os.path.exists("intermediate_ca.pem") and os.path.exists("intermediate_ca.key"):
-        with open("intermediate_ca.pem", "rb") as f: cert_pem = f.read()
-        with open("intermediate_ca.key", "rb") as f: key_pem = f.read()
-        return cert_pem, key_pem
-
-    root_cert = x509.load_pem_x509_certificate(root_cert_pem)
-    root_key = serialization.load_pem_private_key(root_key_pem, None)
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
-    subject = x509.Name([
-        x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Bogus Intermediate"),
-        x509.NameAttribute(NameOID.COMMON_NAME, u"Bogus Intermediate CA"),
-    ])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(root_cert.subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-        .sign(root_key, hashes.SHA256())
-    )
-
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    key_pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption()
-    )
-
-    with open("intermediate_ca.pem", "wb") as f: f.write(cert_pem)
-    with open("intermediate_ca.key", "wb") as f: f.write(key_pem)
-
-    return cert_pem, key_pem
-
-def generate_leaf_cert(hostname: str, interm_cert_pem: bytes, interm_key_pem: bytes) -> tuple[bytes, bytes]:
-    interm_cert = x509.load_pem_x509_certificate(interm_cert_pem)
-    interm_key = serialization.load_pem_private_key(interm_key_pem, None)
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(interm_cert.subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=7))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(hostname)]),
-            critical=False
-        )
-        .sign(interm_key, hashes.SHA256())
-    )
-
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    key_pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption()
-    )
-    return cert_pem, key_pem
 
 
 def load_cert_and_key(cert_pem: bytes, key_pem: bytes) -> tuple[crypto.X509, crypto.PKey]:
@@ -209,82 +233,31 @@ def load_cert_and_key(cert_pem: bytes, key_pem: bytes) -> tuple[crypto.X509, cry
     key = crypto.load_privatekey(crypto.FILETYPE_PEM, key_pem)
     return cert, key
 
-
 def create_dynamic_tls_context(hostname: str) -> SSL.Context:
-    """Generate SSL Context with a leaf cert for the given hostname."""
     leaf_pem, leaf_key = generate_cached_cert(hostname)
     leaf_cert, leaf_key_obj = load_cert_and_key(leaf_pem, leaf_key)
 
     ctx = SSL.Context(SSL.TLS_SERVER_METHOD)
     ctx.use_certificate(leaf_cert)
     ctx.use_privatekey(leaf_key_obj)
-    
-    # Add intermediate to chain
+
+    # Add intermediate
     interm_cert = crypto.load_certificate(crypto.FILETYPE_PEM, INTERM_CA_PEM)
     ctx.add_extra_chain_cert(interm_cert)
-    
-    # ALPN for HTTP/2
-    ctx.set_alpn_select_callback(lambda conn, protos: b"h2" if b"h2" in protos else protos[0])
+
+    # ALPN
+    ctx.set_alpn_select_callback(lambda conn, protos: b"h2" if b"h2" in protos else b"http/1.1")
+    ctx.set_cipher_list(b"ECDHE+AESGCM")
     return ctx
 
-
-def start_tls_tunnel(self, stream_id: int, host: str, port: int, tls_context: SSL.Context):
-    """
-    Handle CONNECT requests by wrapping the client connection in TLS
-    with a dynamically generated certificate (MITM).
-    """
-
-    # Notify client that CONNECT succeeded (HTTP/1.1 style)
-    response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
-    self.transport.write(response)
-
-    # Wrap the existing transport with TLSMemoryBIOProtocol
-    class TunnelTLSProtocol(TLSMemoryBIOProtocol):
-        def __init__(inner_self):
-            # Use parent H2ProxyProtocol as outer protocol
-            super().__init__(None, False)
-
-        def connectionMade(inner_self):
-            # Attach the new TLS layer as the transport for the H2 proxy
-            self.transport = inner_self.transport
-            # Re-init H2 over this new TLS transport
-            try:
-                self.h2_conn.initiate_connection()
-                self.transport.write(self.h2_conn.data_to_send())
-            except Exception:
-                pass
-
-        def dataReceived(inner_self, data):
-            try:
-                # Feed data into H2
-                events = self.h2_conn.receive_data(data)
-            except Exception:
-                self.shutdown(h2.errors.ErrorCodes.PROTOCOL_ERROR)
-                return
-
-            for event in events:
-                if isinstance(event, h2.events.RequestReceived):
-                    self.handle_request(event)
-                elif isinstance(event, h2.events.DataReceived):
-                    meta = self.stream_meta.get(event.stream_id)
-                    if meta:
-                        meta.enqueue(event.data)
-                        meta.set_body_timeout()
-                        try:
-                            self.h2_conn.acknowledge_received_data(len(event.data), event.stream_id)
-                        except Exception:
-                            pass
-
-            try:
-                self.transport.write(self.h2_conn.data_to_send())
-            except Exception:
-                pass
-
-    tls_proto = TunnelTLSProtocol()
-    tls_wrapper = tssl.CertificateOptions(privateKey=None, certificate=None)  # dummy, we’ll patch via OpenSSL
-    # Wrap the transport with OpenSSL context (MITM leaf cert for hostname)
-    tls_proto._tlsContext = tls_context  # manually attach the SSL.Context from create_dynamic_tls_context
-    self.transport.startTLS(tls_proto._tlsContext, tls_proto)
+def make_dynamic_server_context(hostname: str):
+    leaf_pem, leaf_key = generate_cached_cert(hostname)
+    ctx = SSL.Context(SSL.TLS_SERVER_METHOD)
+    ctx.set_options(SSL.OP_NO_TLSv1 | SSL.OP_NO_TLSv1_1)
+    ctx.set_alpn_select_callback(lambda conn, protos: b"h2" if b"h2" in protos else b"http/1.1")
+    ctx.use_certificate(crypto.load_certificate(crypto.FILETYPE_PEM, leaf_pem))
+    ctx.use_privatekey(crypto.load_privatekey(crypto.FILETYPE_PEM, leaf_key))
+    return ctx
 
 def _is_ip_blocked(ip_str: str) -> bool:
     try:
@@ -384,10 +357,7 @@ def incr_bytes_out(n: int): safe_increment("bytes_out_total", n)
 def incr_bytes_in(n: int): safe_increment("bytes_in_total", n)
 def incr_streams_reset(): safe_increment("streams_reset_total", 1)
 
-
 ROOT_CA_PEM, ROOT_KEY_PEM = load_or_create_root_ca()
-ROOT_CA_CERT = x509.load_pem_x509_certificate(ROOT_CA_PEM)
-ROOT_CA_KEY = serialization.load_pem_private_key(ROOT_KEY_PEM, password=None)
 
 INTERM_CA_PEM, INTERM_KEY_PEM = load_or_create_intermediate_ca(ROOT_CA_PEM, ROOT_KEY_PEM)
 
@@ -439,24 +409,262 @@ def generate_cached_cert(hostname="localhost"):
     _cert_cache[hostname] = (leaf_cert_pem, leaf_key_pem, now + CACHE_TTL)
     return leaf_cert_pem, leaf_key_pem
 
-# -------------------------
-# SNI callback
-# -------------------------
-def sni_callback(conn):
-    try:
-        servername = conn.get_servername() or b"localhost"
-        servername = servername.decode()
 
-        leaf_pem, leaf_key = generate_cached_cert(servername)
-        leaf_cert = crypto.load_certificate(crypto.FILETYPE_PEM, leaf_pem)
-        leaf_key_obj = crypto.load_privatekey(crypto.FILETYPE_PEM, leaf_key)
+# --- CONNECT tunnel implementation (Twisted-friendly, bidirectional) ---
+class UpstreamProtocol(Protocol):
+    def __init__(self, client_proto, buffer=None):
+        self.client_proto = client_proto
+        self.buffer = buffer
 
-        conn.use_certificate(leaf_cert)
-        conn.use_privatekey(leaf_key_obj)
+    def connectionMade(self):
+        # link upstream to client
+        self.client_proto.upstream_proto = self
 
-    except Exception as e:
-        logger.exception("SNI callback failed: %s", e)
+        # flush any buffered client bytes
+        if self.buffer:
+            data = self.buffer.getvalue()
+            if data:
+                self.transport.write(data)
+            self.buffer = None
 
+    def dataReceived(self, data):
+        if self.client_proto and self.client_proto.transport:
+            self.client_proto.transport.write(data)
+
+    def connectionLost(self, reason):
+        if self.client_proto and self.client_proto.transport:
+            self.client_proto.transport.loseConnection()
+
+class UpstreamFactory(ClientFactory):
+    def __init__(self, client_proto, buffer):
+        self.client_proto = client_proto
+        self.buffer = buffer
+
+    def buildProtocol(self, addr):
+        # pass the protocol itself, not its transport
+        return UpstreamProtocol(self.client_proto, buffer=self.buffer)
+
+    def clientConnectionFailed(self, connector, reason):
+        if self.client_proto and self.client_proto.transport:
+            self.client_proto.transport.loseConnection()
+
+class ConnectProxyProtocol(Protocol):
+    """
+    Handles HTTP CONNECT and tunnels client <-> upstream.
+    """
+    def __init__(self):
+        self._buffer = BytesIO()
+        self._tunneled = False
+        self.upstream_proto = None
+
+    def dataReceived(self, data: bytes):
+        if self._tunneled:
+            # Forward to upstream if connected
+            if self.upstream_proto and self.upstream_proto.transport:
+                self.upstream_proto.transport.write(data)
+            else:
+                # buffer client data until upstream is ready (bound size)
+                if self._buffer.tell() < 64*1024:
+                    self._buffer.write(data)
+            return
+
+        # Parse CONNECT line
+        try:
+            text = data.decode("utf-8", errors="ignore")
+            first_line = text.splitlines()[0].strip()
+            if not first_line.upper().startswith("CONNECT "):
+                self.transport.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+                self.transport.loseConnection()
+                return
+
+            host_port = first_line.split()[1]
+            host, port_s = host_port.split(":")
+            port = int(port_s)
+        except Exception:
+            self.transport.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            self.transport.loseConnection()
+            return
+
+        logging.info("Proxy CONNECT to %s:%d", host, port)
+
+        # Reply 200 immediately
+        self.transport.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        self._tunneled = True
+
+        # Buffer any trailing bytes after headers
+        hdr_end = data.find(b"\r\n\r\n")
+        remaining = b""
+        if hdr_end != -1:
+            remaining = data[hdr_end+4:]
+        else:
+            hdr_end = data.find(b"\n\n")
+            if hdr_end != -1:
+                remaining = data[hdr_end+2:]
+        if remaining:
+            self._buffer.write(remaining)
+
+        # Connect to upstream
+        factory = UpstreamFactory(self, self._buffer)
+        try:
+            reactor.connectTCP(host, port, factory)
+        except Exception:
+            try:
+                self.transport.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            except Exception:
+                pass
+            self.transport.loseConnection()
+
+    def connectionLost(self, reason):
+        # Close upstream if client disconnected
+        try:
+            if self.upstream_proto and getattr(self.upstream_proto, "transport", None):
+                self.upstream_proto.transport.loseConnection()
+        except Exception:
+            pass
+        
+class MyCertificateOptions(tssl.CertificateOptions):
+    def __init__(self, cert_pem, key_pem, sni_callback=None):
+        super().__init__(
+            privateKey=crypto.load_privatekey(crypto.FILETYPE_PEM, key_pem),
+            certificate=crypto.load_certificate(crypto.FILETYPE_PEM, cert_pem),
+            verify=False,
+            enableSingleUseKeys=True
+        )
+        self._sni_callback = sni_callback
+
+    def getContext(self):
+        ctx = super().getContext()
+        if self._sni_callback:
+            ctx.set_tlsext_servername_callback(self._sni_callback)
+        # ALPN protocols: prefer h2 over http/1.1
+        ctx.set_alpn_select_callback(lambda conn, protos: b"h2" if b"h2" in protos else b"http/1.1")
+        return ctx
+
+class ProxyMultiplexer(Factory):
+    # The factory returns an ALPN selector protocol which will pick the real app protocol
+    def buildProtocol(self, addr):
+        return ALPNSelector()
+
+class ALPNSelector(Protocol):
+    """
+    Application-layer protocol installed under TLS.  After the TLS handshake
+    completes ALPN will be available and we swap in the appropriate handler.
+    We schedule the ALPN check on the reactor to avoid racing with the TLS handshake.
+    """
+    def connectionMade(self):
+        # Use ConnectProxyProtocol as permanent handler
+        self._fallback = ConnectProxyProtocol()
+        self._fallback.factory = getattr(self, "factory", None)
+        self.transport.protocol = self._fallback
+        self._fallback.makeConnection(self.transport)
+
+        # negotiatedProtocol is the usual attribute Twisted sets after ALPN negotiation.
+        negotiated = None
+        try:
+            negotiated = getattr(self.transport, "negotiatedProtocol", None)
+            if callable(negotiated):
+                negotiated = negotiated()
+        except Exception:
+            negotiated = None
+
+        # if negotiated is bytes, decode
+        if isinstance(negotiated, bytes):
+            negotiated = negotiated
+
+        # Decide which protocol to swap in
+        if negotiated == b"h2":
+            proto = H2ProxyProtocol(self.transport)
+            # H2ProxyProtocol expects transport param in its ctor in your code
+        else:
+            # Use ConnectProxyProtocol as fallback (e.g. for browsers that will do CONNECT)
+            proto = self._fallback   # reuse existing fallback
+            proto.factory = getattr(self, "factory", None)
+
+        # Now swap the real protocol in
+        try:
+            # First, if fallback was installed, try to cleanly disconnect it
+            try:
+                if hasattr(self, "_fallback") and self._fallback is not None:
+                    # give fallback a chance to .connectionLost if it needs to cleanup
+                    pass
+            except Exception:
+                pass
+
+            self.transport.protocol = proto
+            if not getattr(proto, "_made_connection", False):
+            # Call makeConnection on the new protocol so it sees the transport
+                proto._made_connection = True
+                proto.makeConnection(self.transport)
+        except Exception:
+            logger.exception("Failed to swap ALPN protocol")
+            try:
+                self.transport.loseConnection()
+            except Exception:
+                pass
+
+        self._swapped = True
+
+    def dataReceived(self, data):
+        # Forward directly to the fallback
+        self._fallback.dataReceived(data)
+
+# Minimal TLSProtocolWrapper
+class TLSProtocolWrapper(TLSMemoryBIOProtocol):
+    def __init__(self, protocol, context):
+        super().__init__(protocol, context)
+        self.wrapped_protocol = protocol
+
+    def connectionMade(self):
+        self.wrapped_protocol.makeConnection(self.transport)
+        super().connectionMade()
+
+    def dataReceived(self, data):
+        self.wrapped_protocol.dataReceived(data)
+
+class DynamicContextFactory(ContextFactory):
+    """
+    Wrap an OpenSSL SSL.Context so Twisted can use it.
+    """
+    def __init__(self, root_cert, root_key):
+        self.root_cert = root_cert
+        self.root_key = root_key
+        self._ctx = self._make_context()
+
+    def _make_context(self):
+        ctx = SSL.Context(SSL.TLS_SERVER_METHOD)
+
+        # Load root CA for signing
+        ctx.use_certificate(self.root_cert)
+        ctx.use_privatekey(self.root_key)
+
+        # Disable legacy protocols
+        ctx.set_options(
+            SSL.OP_NO_SSLv2 |
+            SSL.OP_NO_SSLv3 |
+            SSL.OP_NO_TLSv1 |
+            SSL.OP_NO_TLSv1_1
+        )
+
+        # Advertise ALPN protocols (HTTP/2 first, then HTTP/1.1)
+        try:
+            ctx.set_alpn_select_callback(
+                lambda conn, protos: b"h2" if b"h2" in protos else b"http/1.1"
+            )
+        except Exception as e:
+            logger.warning("ALPN not available: %s", e)
+
+        # Hook SNI → your dynamic leaf cert generator
+        def sni_cb(conn):
+            hostname = conn.get_servername().decode() if conn.get_servername() else "localhost"
+            dyn_ctx = create_dynamic_tls_context(hostname)
+            conn.set_context(dyn_ctx)
+
+        ctx.set_tlsext_servername_callback(sni_cb)
+        return ctx
+
+    def getContext(self):
+        return self._ctx
+    
 # ---------- Active H2 protocols ----------
 _active_h2_protocols: Set["H2ProxyProtocol"] = set()
 
@@ -486,19 +694,12 @@ class StreamMeta:
         self.method = method
 
     def enqueue(self, data: bytes):
-        if not data:
-            return
         if self.buffered_bytes + len(data) > MAX_BUFFER_PER_STREAM:
-            logger.warning("Stream %d buffer exceeded %d bytes, resetting",
-                           self.stream_id, MAX_BUFFER_PER_STREAM)
             self.reset_stream(h2.errors.ErrorCodes.ENHANCE_YOUR_CALM)
             return
-        # Break into fixed-size chunks
         for i in range(0, len(data), self.CHUNK_SIZE):
-            chunk = memoryview(data[i:i+self.CHUNK_SIZE])
-            self.chunks.append(chunk)
-            self.buffered_bytes += len(chunk)
-        self.last_activity = time.time()
+            self.chunks.append(memoryview(data[i:i+self.CHUNK_SIZE]))
+            self.buffered_bytes += len(data[i:i+self.CHUNK_SIZE])
         self.reset_inactivity_timer()
 
     def pop_chunk(self, max_size: int) -> Optional[bytes]:
@@ -769,7 +970,6 @@ class UpstreamAgentRequest:
         else:
             self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
 
-
 # ---------------------------------------------------------------------
 # H2 protocol implementation (server-side) -- unchanged
 # ---------------------------------------------------------------------
@@ -788,6 +988,7 @@ class H2ProxyProtocol:
         # Separate Agents to make intent clear: both are HTTP/1.1 clients.
         self.agent_http = Agent(reactor)  # plain HTTP/1.1
         self.agent_https = Agent(reactor, BrowserLikePolicyForHTTPS())  # HTTPS over TLS (still H1)
+        self._sending_loop_active = False
 
         # Advertise sensible settings immediately
         try:
@@ -817,7 +1018,6 @@ class H2ProxyProtocol:
             except Exception:
                 pass
             
-
     def handle_request(self, event: h2.events.RequestReceived):
         safe_increment("requests_total", 1)
 
@@ -860,17 +1060,21 @@ class H2ProxyProtocol:
             return
 
         # --- Firefox HTTPS proxy support ---
-        if method.upper() == "CONNECT":
-            host, sep, port = path.partition(":")
-            port = int(port) if sep else 443
-            try:
-                # Use your dynamic cert system to create a TLS context for host
-                tls_context = create_dynamic_tls_context(host)
-                # Wrap the client connection and start transparent tunnel
-                self.start_tls_tunnel(event.stream_id, host, port, tls_context)
-            except Exception as e:
-                logger.warning("Failed to establish CONNECT tunnel to %s:%s: %s", host, port, e)
-                send_h2_response(502)
+        if method == "CONNECT":
+            host, port = authority.split(":")
+            logger.info("CONNECT request for %s:%s", host, port)
+
+            # Send 200 back so browser thinks tunnel is ready
+            response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+            self.transport.write(response)
+
+            # Now switch protocol: wrap self.transport with TLS using our dynamic cert
+            ctx = create_dynamic_tls_context(host)
+            self.transport.startTLS(ctx, serverSide=True)
+
+            # From here on, ALPN negotiates h2 with Firefox
+            self.h2_conn.initiate_connection()
+            self.transport.write(self.h2_conn.data_to_send())
             return
 
         # Concurrency guard
@@ -915,8 +1119,6 @@ class H2ProxyProtocol:
 
         # Start upstream request
         UpstreamAgentRequest(self, meta, method, absolute_url, upstream_headers).start()
-
-
 
     def dataReceived(self, data: bytes):
         # reset idle timer
@@ -1056,33 +1258,23 @@ class H2ProxyProtocol:
         reactor.callLater(0, self._send_loop)
 
     def _send_loop(self):
-        # mark sending active
-        if getattr(self, "_sending_loop_active", False):
-            return
         self._sending_loop_active = True
-
         try:
-            any_sent = False
-            for meta in self.stream_meta.values():
-                if meta.closed or meta.buffered_bytes <= 0:
+            for stream_id, meta in list(self.stream_meta.items()):
+                if meta.closed and meta.buffered_bytes == 0:
                     continue
-
-                while chunk := meta.pop_chunk(self.max_frame_size):
+                while self.h2_conn.remote_flow_control_window(stream_id) > 0:
+                    chunk = meta.pop_chunk(self.max_frame_size)
+                    if not chunk:
+                        break
                     try:
-                        self.h2_conn.send_data(meta.stream_id, chunk)
+                        self.h2_conn.send_data(stream_id, chunk)
                         self.transport.write(self.h2_conn.data_to_send())
                         incr_bytes_out(len(chunk))
-                        any_sent = True
                     except Exception:
                         meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
-
         finally:
             self._sending_loop_active = False
-            # schedule next tick if there is remaining buffered data
-            if any(meta.buffered_bytes > 0 for meta in self.stream_meta.values()):
-                reactor.callLater(0.01, self._send_loop)
-
-
 
     def initiate_push(self, parent_stream_id: int, link_path: str):
         return 
@@ -1126,45 +1318,39 @@ class H2ProtocolWrapper(Protocol):
     def connectionLost(self, reason=None):
         try:
             _active_h2_protocols.discard(self.h2)
+            if self.h2_proto:
+                try:
+                    self.h2_proto.shutdown()
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def dataReceived(self, data):
         self.h2.dataReceived(data)
+        if not self.h2_proto:
+            # decide protocol (H2 vs fallback)
+            negotiated = getattr(self.transport, "negotiatedProtocol", lambda: None)()
+            if negotiated == b"h2":
+                self.h2_proto = H2ProxyProtocol(self.transport)
+            else:
+                # fallback for plain HTTP/1.1 CONNECT
+                self.h2_proto = ConnectProxyProtocol()
+                self.h2_proto.factory = self.factory
+            self.h2_proto.connectionMade()
+        self.h2_proto.dataReceived(data)
 
-class H2Factory(Factory):
-    def buildProtocol(self, addr):
-        return H2ProtocolWrapper()
-    
-class H2ServerContextFactory(ContextFactory):
-    def __init__(self):
-        self.intermediate_cert_pem = INTERM_CA_PEM
-        self.intermediate_key_pem = INTERM_KEY_PEM
 
-    def getContext(self):
-        ctx = SSL.Context(SSL.TLS_SERVER_METHOD)
-
-        # load intermediate cert once
-        interm_cert = crypto.load_certificate(crypto.FILETYPE_PEM, INTERM_CA_PEM)
-        ctx.add_extra_chain_cert(interm_cert)
-
-        # dummy cert for initial handshake
-        dummy_cert_pem, dummy_key_pem = generate_leaf_cert("localhost", INTERM_CA_PEM, INTERM_KEY_PEM)
-        cert, key = load_cert_and_key(dummy_cert_pem, dummy_key_pem)
-        ctx.use_certificate(cert)
-        ctx.use_privatekey(key)
-
-        ctx.set_alpn_select_callback(lambda conn, protos: b"h2" if b"h2" in protos else protos[0])
-        ctx.set_tlsext_servername_callback(sni_callback)
-        return ctx
-    
 def start_tls_listener():
-    factory = H2Factory()
-    ctx_factory = H2ServerContextFactory()
-    endpoint = endpoints.SSL4ServerEndpoint(reactor, LISTEN_PORT, ctx_factory)
-    endpoint.listen(factory)
-    logger.info(f"TLS listener started on port {LISTEN_PORT} (HTTP/2 via ALPN)")
+    cert, key = load_or_create_root_ca()
+    ctx_factory = DynamicContextFactory(cert, key)
+    factory = ProxyMultiplexer()
 
+    # This is the simple, correct path: let Twisted drive the TLS layer.
+    reactor.listenSSL(LISTEN_PORT, factory, ctx_factory)
+    logger.info("TLS listener started on port %d (HTTP/2 via ALPN)", LISTEN_PORT)
+    reactor.run()
+    
 # ---------- Metrics server ----------
 def start_metrics_server():
     if USE_PROMETHEUS_CLIENT:
@@ -1187,8 +1373,6 @@ def shutdown_all(*args):
 signal.signal(signal.SIGINT, shutdown_all)
 signal.signal(signal.SIGTERM, shutdown_all)
 
-
 if __name__ == "__main__":
     start_tls_listener()
     start_metrics_server()
-    reactor.run()
