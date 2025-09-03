@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple, Set
 
 from twisted.internet import reactor, task, defer, ssl as tssl
 from twisted.internet.threads import deferToThread
-from twisted.internet.protocol import Protocol, Factory, ClientFactory
+from twisted.internet.protocol import Protocol, Factory, ClientFactory, ServerFactory
 from twisted.web.client import Agent, BrowserLikePolicyForHTTPS
 from twisted.web.http_headers import Headers
 from twisted.internet.defer import Deferred
@@ -16,9 +16,11 @@ from twisted.protocols.policies import TimeoutMixin
 from twisted.web.server import Site
 from twisted.web.wsgi import WSGIResource
 from twisted.web.client import FileBodyProducer
-from twisted.internet.ssl import ContextFactory
+from twisted.internet.ssl import ContextFactory, optionsForClientTLS, CertificateOptions, PrivateCertificate, Certificate, KeyPair
 from twisted.protocols.tls import TLSMemoryBIOProtocol, TLSMemoryBIOFactory
-from twisted.internet.endpoints import TCP4ServerEndpoint
+from twisted.internet.endpoints import TCP4ServerEndpoint, TCP4ClientEndpoint, connectProtocol, SSL4ClientEndpoint
+from twisted.internet.interfaces import ITransport
+from zope.interface import implementer
 
 from OpenSSL import SSL, crypto
 from cryptography import x509
@@ -26,14 +28,26 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import datetime
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 
+# --- hyper-h2 imports ---
 import h2.connection
 import h2.events
 import h2.config
 import h2.settings
 import h2.errors
-import os
+from h2.connection import H2Connection
+from h2.config import H2Configuration
+from h2.events import (
+    RequestReceived,
+    ResponseReceived,
+    DataReceived,
+    StreamEnded,
+    RemoteSettingsChanged,
+    SettingsAcknowledged,
+    WindowUpdated,
+)
+from h2.config import H2Configuration
 
 from io import BytesIO
 import urllib.request
@@ -43,7 +57,10 @@ from urllib.parse import urlparse
 import re
 import zlib
 import logging
-import secrets
+import threading
+import os
+
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -410,118 +427,654 @@ def generate_cached_cert(hostname="localhost"):
     return leaf_cert_pem, leaf_key_pem
 
 
-# --- CONNECT tunnel implementation (Twisted-friendly, bidirectional) ---
-class UpstreamProtocol(Protocol):
-    def __init__(self, client_proto, buffer=None):
-        self.client_proto = client_proto
-        self.buffer = buffer
+# -----------------------------
+# H2Bridge (hyper-h2) - maps client H2 <-> upstream H2
+# -----------------------------
+class H2Bridge:
+    def __init__(self, proto, tls_upstream):
+        """
+        proto: ConnectProxyProtocol instance (reactor thread)
+        tls_upstream: pyOpenSSL Connection (client-mode) over real socket (handshake done)
+        """
+        self.proto = proto
+        self.tls_u = tls_upstream
+        self.down_conn = H2Connection(config=H2Configuration(client_side=False))
+        self.up_conn = H2Connection(config=H2Configuration(client_side=True))
+        self.stream_map = {}     # client_stream_id -> upstream_stream_id
+        self._running = True
+        self._lock = threading.Lock()
 
-    def connectionMade(self):
-        # link upstream to client
-        self.client_proto.upstream_proto = self
+        # init both sides; send connection preface/settings
+        self.down_conn.initiate_connection()
+        self.proto._downstream_send_plain(self.down_conn.data_to_send())
 
-        # flush any buffered client bytes
-        if self.buffer:
-            data = self.buffer.getvalue()
-            if data:
-                self.transport.write(data)
-            self.buffer = None
+        self.up_conn.initiate_connection()
+        self._send_to_upstream(self.up_conn.data_to_send())
 
-    def dataReceived(self, data):
-        if self.client_proto and self.client_proto.transport:
-            self.client_proto.transport.write(data)
+        # thread to read plaintext from upstream TLS
+        self.up_recv_thread = threading.Thread(target=self._upstream_recv_loop, daemon=True)
+        self.up_recv_thread.start()
 
-    def connectionLost(self, reason):
-        if self.client_proto and self.client_proto.transport:
-            self.client_proto.transport.loseConnection()
+    def stop(self):
+        self._running = False
+        try:
+            self.tls_u.close()
+        except Exception:
+            pass
 
-class UpstreamFactory(ClientFactory):
-    def __init__(self, client_proto, buffer):
-        self.client_proto = client_proto
-        self.buffer = buffer
+    def _send_to_downstream(self, data):
+        if data:
+            self.proto._downstream_send_plain(data)
 
-    def buildProtocol(self, addr):
-        # pass the protocol itself, not its transport
-        return UpstreamProtocol(self.client_proto, buffer=self.buffer)
+    def _send_to_upstream(self, data):
+        if not data:
+            return
+        try:
+            self.tls_u.send(data)
+        except Exception as e:
+            self.proto._log_err("send_to_upstream error: %s", e)
 
-    def clientConnectionFailed(self, connector, reason):
-        if self.client_proto and self.client_proto.transport:
-            self.client_proto.transport.loseConnection()
+    # Call in reactor thread when plaintext from downstream arrives
+    def receive_from_downstream_plaintext(self, data):
+        events = self.down_conn.receive_data(data)
+        for ev in events:
+            if isinstance(ev, RequestReceived):
+                headers = [(n, v) for n, v in ev.headers]
+                u_stream = self.up_conn.get_next_available_stream_id()
+                self.stream_map[ev.stream_id] = u_stream
+                self.up_conn.send_headers(u_stream, headers, end_stream=False)
+                self._send_to_upstream(self.up_conn.data_to_send())
 
-class ConnectProxyProtocol(Protocol):
+            elif isinstance(ev, DataReceived):
+                u_stream = self.stream_map.get(ev.stream_id)
+                if u_stream is None:
+                    continue
+                self.up_conn.send_data(u_stream, ev.data, end_stream=False)
+                self._send_to_upstream(self.up_conn.data_to_send())
+
+                # acknowledge to client side
+                self.down_conn.acknowledge_received_data(len(ev.data), ev.stream_id)
+                self._send_to_downstream(self.down_conn.data_to_send())
+
+            elif isinstance(ev, StreamEnded):
+                u_stream = self.stream_map.get(ev.stream_id)
+                if u_stream:
+                    self.up_conn.end_stream(u_stream)
+                    self._send_to_upstream(self.up_conn.data_to_send())
+
+            # ignore other events for brevity
+
+        pending = self.down_conn.data_to_send()
+        if pending:
+            self._send_to_downstream(pending)
+
+    # thread: read plaintext HTTP/2 frames from upstream TLS, dispatch to reactor
+    def _upstream_recv_loop(self):
+        import time
+        while self._running:
+            try:
+                data = self.tls_u.recv(65536)
+            except SSL.WantReadError:
+                time.sleep(0.01)
+                continue
+            except Exception:
+                break
+            if not data:
+                break
+            reactor.callFromThread(self._handle_upstream_data, data)
+
+    def _handle_upstream_data(self, data):
+        events = self.up_conn.receive_data(data)
+        for ev in events:
+            # map upstream -> client stream ids
+            if isinstance(ev, ResponseReceived):
+                client_stream = None
+                for c, u in self.stream_map.items():
+                    if u == ev.stream_id:
+                        client_stream = c
+                        break
+                if client_stream is None:
+                    continue
+                headers = [(n, v) for n, v in ev.headers]
+                self.down_conn.send_headers(client_stream, headers, end_stream=False)
+                self._send_to_downstream(self.down_conn.data_to_send())
+
+            elif isinstance(ev, DataReceived):
+                client_stream = None
+                for c, u in self.stream_map.items():
+                    if u == ev.stream_id:
+                        client_stream = c
+                        break
+                if client_stream is None:
+                    continue
+                self.down_conn.send_data(client_stream, ev.data, end_stream=False)
+                self._send_to_downstream(self.down_conn.data_to_send())
+
+                # ack upstream
+                self.up_conn.acknowledge_received_data(len(ev.data), ev.stream_id)
+                if self.up_conn.data_to_send():
+                    self._send_to_upstream(self.up_conn.data_to_send())
+
+            elif isinstance(ev, StreamEnded):
+                client_stream = None
+                for c, u in self.stream_map.items():
+                    if u == ev.stream_id:
+                        client_stream = c
+                        break
+                if client_stream:
+                    self.down_conn.end_stream(client_stream)
+                    self._send_to_downstream(self.down_conn.data_to_send())
+
+        # send any pending frames upstream (e.g., SETTINGS ACK)
+        to_up = self.up_conn.data_to_send()
+        if to_up:
+            self._send_to_upstream(to_up)
+
+
+# --- memory-BIO helpers for downstream (client-facing) TLS ---
+def tls_mem_flush_out(tls_conn, transport):
+    """Drain TLS record bytes from the memory BIO to the network transport."""
+    while True:
+        try:
+            out = tls_conn.bio_read(16384)
+            if not out:
+                break
+            transport.write(out)
+        except SSL.WantReadError:
+            break
+
+
+def tls_mem_feed_in(tls_conn, data):
+    """Feed network bytes into the TLS memory BIO."""
+    tls_conn.bio_write(data)
+
+
+def make_downstream_server_tls_ctx(cert_pem_bytes, key_pem_bytes):
+    ctx = SSL.Context(SSL.TLS_SERVER_METHOD)
+    cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_pem_bytes)
+    key = crypto.load_privatekey(crypto.FILETYPE_PEM, key_pem_bytes)
+    ctx.use_certificate(cert)
+    ctx.use_privatekey(key)
+    # prefer h2 to http/1.1 when client offers
+    def alpn_cb(conn, protos):
+        return b"h2" if b"h2" in protos else b"http/1.1"
+    ctx.set_alpn_select_callback(alpn_cb)
+    ctx.set_options(SSL.OP_NO_SSLv2 | SSL.OP_NO_SSLv3)
+    return ctx
+
+
+# --- upstream TLS worker (threaded) ---
+def start_upstream_tls_and_pump(client_proto, host, port):
     """
-    Handles HTTP CONNECT and tunnels client <-> upstream.
+    Thread: connect to upstream host:port, do TLS handshake with SNI+ALPN,
+    attach upstream TLS Connection to client_proto via reactor.callFromThread,
+    then pump upstream->client plaintext by calling client_proto._downstream_send_plain
     """
-    def __init__(self):
-        self._buffer = BytesIO()
-        self._tunneled = False
-        self.upstream_proto = None
+    def run():
+        ctx = SSL.Context(SSL.TLS_CLIENT_METHOD)
+        ctx.set_options(SSL.OP_NO_SSLv2 | SSL.OP_NO_SSLv3)
+        ctx.set_alpn_protos([b"h2", b"http/1.1"])
 
-    def dataReceived(self, data: bytes):
-        if self._tunneled:
-            # Forward to upstream if connected
-            if self.upstream_proto and self.upstream_proto.transport:
-                self.upstream_proto.transport.write(data)
-            else:
-                # buffer client data until upstream is ready (bound size)
-                if self._buffer.tell() < 64*1024:
-                    self._buffer.write(data)
+        try:
+            sock = socket.create_connection((host, port))
+        except Exception as e:
+            logger.error("[Upstream] connect fail %s:%s %s", host, port, e)
+            reactor.callFromThread(lambda: client_proto.transport.loseConnection())
             return
 
-        # Parse CONNECT line
+        tls_u = SSL.Connection(ctx, sock)
         try:
-            text = data.decode("utf-8", errors="ignore")
-            first_line = text.splitlines()[0].strip()
-            if not first_line.upper().startswith("CONNECT "):
-                self.transport.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            tls_u.set_tlsext_host_name(host.encode("idna"))
+        except Exception:
+            pass
+        tls_u.set_connect_state()
+
+        try:
+            tls_u.do_handshake()
+            try:
+                up_alpn = tls_u.get_alpn_proto_negotiated()
+            except Exception:
+                up_alpn = None
+            logger.info("[Upstream] handshake OK %s:%s ALPN=%s", host, port, up_alpn)
+        except Exception as exc:
+            emsg = str(exc)
+            logger.error("[Upstream] handshake fail %s", emsg)
+            try:
+                tls_u.close()
+            except Exception:
+                pass
+            reactor.callFromThread(lambda: client_proto.transport.loseConnection())
+            return
+
+        # attach upstream to protocol (reactor thread)
+        reactor.callFromThread(lambda: client_proto._attach_upstream(tls_u))
+
+        # pump upstream -> client plaintext
+        try:
+            while True:
+                try:
+                    data = tls_u.recv(16384)
+                except SSL.WantReadError:
+                    # avoid busy loop
+                    time.sleep(0.01)
+                    continue
+                except Exception:
+                    break
+                if not data:
+                    break
+                # schedule writing plaintext into downstream TLS in reactor
+                reactor.callFromThread(lambda d=data: client_proto._downstream_send_plain(d))
+        finally:
+            try:
+                tls_u.close()
+            except Exception:
+                pass
+            reactor.callFromThread(lambda: client_proto.transport.loseConnection())
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+
+# --- main protocol ---
+class ConnectProxyProtocol(Protocol):
+    def __init__(self):
+        self._buf = b""
+        self._tunneled = False
+        self._host = None
+        self._port = None
+
+        # inner TLS (server-mode via memory BIO)
+        self._tls_d = None
+        self._downstream_hs_done = False
+
+        # upstream TLS connection (pyOpenSSL.Connection)
+        self._upstream = None
+
+    # convenience logs
+    def _log_info(self, *a): logger.info(*a)
+    def _log_err(self, *a): logger.error(*a)
+
+    def _attach_upstream(self, tls_conn):
+        """Called in reactor thread when upstream TLS is ready"""
+        self._upstream = tls_conn
+        # If downstream handshake already done, we can proceed to exchange plaintext
+        try:
+            down_alpn = None
+            up_alpn = None
+            try:
+                down_alpn = self._tls_d.get_alpn_proto_negotiated()
+            except Exception:
+                pass
+            try:
+                up_alpn = tls_conn.get_alpn_proto_negotiated()
+            except Exception:
+                pass
+            self._log_info("attach_upstream: down_alpn=%s up_alpn=%s", down_alpn, up_alpn)
+        except Exception as e:
+            self._log_err("attach_upstream error: %s", e)
+
+    def _downstream_send_plain(self, data):
+        """
+        Called in reactor thread with plaintext that must be encrypted to the client.
+        Writes plaintext into server-mode memory BIO and flushes TLS records to transport.
+        """
+        if not self._tls_d:
+            return
+        try:
+            self._tls_d.send(data)
+        except SSL.WantWriteError:
+            pass
+        tls_mem_flush_out(self._tls_d, self.transport)
+
+    # Twisted: plaintext data from outer TLS -> go into parsing CONNECT or into inner TLS bytes
+    def dataReceived(self, data):
+        # If CONNECT not processed yet, parse it
+        if not self._tunneled:
+            self._buf += data
+            if b"\r\n\r\n" not in self._buf:
+                return
+            if not self._parse_and_ack_connect():
+                return
+
+            # Create per-host leaf cert for inner TLS and accept inner TLS via memory BIO
+            try:
+                cert_pem, key_pem = generate_cached_cert(self._host)
+            except Exception as e:
+                self._log_err("cert generation failed: %s", e)
+                self.transport.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 self.transport.loseConnection()
                 return
 
-            host_port = first_line.split()[1]
-            host, port_s = host_port.split(":")
-            port = int(port_s)
-        except Exception:
-            self.transport.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            ctx = make_downstream_server_tls_ctx(cert_pem, key_pem)
+            self._tls_d = SSL.Connection(ctx, None)
+            self._tls_d.set_accept_state()
+
+            # flush any initial ServerHello etc
+            tls_mem_flush_out(self._tls_d, self.transport)
+
+            # Kick off upstream TLS thread (will attach upstream via callFromThread)
+            start_upstream_tls_and_pump(self, self._host, self._port)
+            return
+
+        # After CONNECT ack: bytes belong to the inner TLS handshake/application
+        if not self._tls_d:
             self.transport.loseConnection()
             return
 
-        logging.info("Proxy CONNECT to %s:%d", host, port)
+        # Feed the bytes into the memory-BIO
+        tls_mem_feed_in(self._tls_d, data)
 
-        # Reply 200 immediately
-        self.transport.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        self._tunneled = True
-
-        # Buffer any trailing bytes after headers
-        hdr_end = data.find(b"\r\n\r\n")
-        remaining = b""
-        if hdr_end != -1:
-            remaining = data[hdr_end+4:]
-        else:
-            hdr_end = data.find(b"\n\n")
-            if hdr_end != -1:
-                remaining = data[hdr_end+2:]
-        if remaining:
-            self._buffer.write(remaining)
-
-        # Connect to upstream
-        factory = UpstreamFactory(self, self._buffer)
-        try:
-            reactor.connectTCP(host, port, factory)
-        except Exception:
+        # Progress downstream handshake if needed
+        if not self._downstream_hs_done:
             try:
-                self.transport.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            except Exception:
+                self._tls_d.do_handshake()
+                self._downstream_hs_done = True
+                try:
+                    alpn = self._tls_d.get_alpn_proto_negotiated()
+                except Exception:
+                    alpn = None
+                self._log_info("[Downstream] client handshake OK, ALPN=%s", alpn)
+            except SSL.WantReadError:
+                # need more bytes from client
                 pass
-            self.transport.loseConnection()
+            except SSL.WantWriteError:
+                # OpenSSL wants to write records (flush below)
+                pass
+            except Exception as e:
+                self._log_err("[Downstream] handshake fail: %s", e)
+                self.transport.loseConnection()
+                return
+
+        # Flush any produced TLS records to client
+        tls_mem_flush_out(self._tls_d, self.transport)
+
+        # If handshake complete and upstream ready, move plaintext client->upstream
+        if self._downstream_hs_done and self._upstream:
+            while True:
+                try:
+                    plaintext = self._tls_d.recv(16384)
+                except SSL.WantReadError:
+                    break
+                except Exception:
+                    self.transport.loseConnection()
+                    return
+                if not plaintext:
+                    self.transport.loseConnection()
+                    return
+                # send plaintext to upstream TLS
+                try:
+                    self._upstream.send(plaintext)
+                except SSL.WantWriteError:
+                    # upstream busy; minimal drop or you may buffer here
+                    pass
+                except Exception:
+                    self.transport.loseConnection()
+                    return
 
     def connectionLost(self, reason):
-        # Close upstream if client disconnected
         try:
-            if self.upstream_proto and getattr(self.upstream_proto, "transport", None):
-                self.upstream_proto.transport.loseConnection()
+            if self._upstream:
+                self._upstream.close()
         except Exception:
             pass
-        
+        self._log_info("connectionLost: %s", reason)
+
+    def _parse_and_ack_connect(self):
+        try:
+            head, _ = self._buf.split(b"\r\n", 1)
+            method, hostport, _ = head.split()
+            if method.upper() != b"CONNECT":
+                self.transport.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                self.transport.loseConnection()
+                return False
+            host, port_s = hostport.split(b":")
+            self._host = host.decode()
+            self._port = int(port_s)
+        except Exception:
+            self.transport.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            self.transport.loseConnection()
+            return False
+
+        self.transport.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        self._tunneled = True
+        self._buf = b""
+        self._log_info("[Proxy] CONNECT %s:%s", self._host, self._port)
+        return True
+
+# -----------------------------
+# Helpful hexdump (short)
+# -----------------------------
+#def short_hexdump_labelled(label: str, data: bytes, max_bytes: int = 512) -> str:
+#    if not data:
+#        return f"{label}: (0 bytes)"
+#    shown = data[:max_bytes]
+#    hexpart = binascii.hexlify(shown).decode('ascii')
+#    # ascii-friendly view (non-printable => .)
+#    ascii_part = ''.join(ch if ch in string.printable and ch not in '\r\n\t' else '.' for ch in shown.decode('latin1'))
+#    more = "..." if len(data) > max_bytes else ""
+#    return f"{label}: {len(data)} bytes {more}\n  HEX: {hexpart}{more}\n  ASCII: {ascii_part}{more}"
+
+#def hexdump_short(data, max_bytes=256):
+#    shown = data[:max_bytes]
+#    hexpart = binascii.hexlify(shown).decode('ascii')
+#    ascii_part = ''.join(ch if ch in string.printable and ch not in '\r\n\t' else '.' for ch in shown.decode('latin1'))
+#    more = '...' if len(data) > max_bytes else ''
+#    return f"{len(data)} bytes{more}\n  HEX: {hexpart}{more}\n  ASCII: {ascii_part}{more}"
+
+
+# -----------------------------
+# Upstream proxy protocol (for raw TCP tunnel) -- enhanced logging
+# -----------------------------
+#class UpstreamProxyProtocol(Protocol):
+#    def __init__(self, client_proto):
+#        self.client_proto = client_proto
+#        self._bytes_from_upstream = 0
+#        self._first_upstream_hexdumped = False
+
+#    def connectionMade(self):
+#        # pair with the client
+#        self.client_proto.upstream_proto = self
+#        logger.info("UpstreamProxyProtocol.connectionMade -> paired with client")
+#        # if client had buffered bytes, flush them now (client may have buffered clientHello)
+#        if getattr(self.client_proto, "_buffered_after_connect", b""):
+#            try:
+#                data = self.client_proto._buffered_after_connect
+#                logger.info("Flushing %d buffered bytes from client to upstream on connect", len(data))
+#                self.transport.write(data)
+#                # log first bytes that we forwarded
+#                logger.info(short_hexdump_labelled("Client->Upstream (flushed buffered)", data, max_bytes=512))
+#            except Exception:
+#                logger.exception("Error flushing buffered data to upstream")
+#            self.client_proto._buffered_after_connect = b''
+
+#    def dataReceived(self, data):
+#        # upstream -> proxy -> client
+#        self._bytes_from_upstream += len(data)
+#        # log first upstream bytes we receive (only once, to avoid log spam)
+#        if not self._first_upstream_hexdumped:
+#            logger.info(short_hexdump_labelled("Upstream->Proxy (first)", data, max_bytes=512))
+#            self._first_upstream_hexdumped = True
+#        try:
+#            if self.client_proto and self.client_proto.transport:
+#                self.client_proto.transport.write(data)
+#                logger.debug("Forwarded %d bytes upstream->client (total from upstream: %d)", len(data), self._bytes_from_upstream)
+#        except Exception:
+#            logger.exception("Failed writing to client; closing both sides")
+#            try: self.client_proto.transport.loseConnection()
+#            except Exception: pass
+#            try: self.transport.loseConnection()
+#            except Exception: pass
+
+#    def connectionLost(self, reason):
+#        logger.info("Upstream connectionLost: %r", reason)
+#        try:
+#            if self.client_proto and self.client_proto.transport:
+#                self.client_proto.transport.loseConnection()
+#        except Exception:
+#            pass
+
+
+# -----------------------------
+# CONNECT Proxy (client-facing) -- enhanced logging
+# -----------------------------
+#class ConnectProxyProtocol(Protocol):
+#    def __init__(self):
+#        self._buffer = b""
+#        self._tunneled = False
+#        self._host = None
+#        self._port = None
+#        self.upstream_proto = None
+#        # buffer for bytes from client that arrive after CONNECT but before upstream ready
+#        self._buffered_after_connect = b""
+#        self._bytes_from_client = 0
+#        self._bytes_to_client = 0
+#        self._first_client_hexdumped = False
+
+#    def dataReceived(self, data):
+#        logger.debug("Client->proxy: dataReceived %d bytes (tunneled=%s)", len(data), self._tunneled)
+#        # If we are already tunneled, *always* log the first chunk(s) from client
+#        if self._tunneled:
+#            # log raw bytes from client after CONNECT (this should include ClientHello)
+#            logger.info("Client->proxy (post-CONNECT) raw chunk:\n%s", hexdump_short(data, max_bytes=512))
+
+#        # If tunnel is established and we have an upstream, pipe raw bytes client->upstream.
+#        if self._tunneled and self.upstream_proto and getattr(self.upstream_proto, "transport", None):
+#            try:
+#                self._bytes_from_client += len(data)
+#                # log once the first client->upstream bytes (likely ClientHello)
+#                if not self._first_client_hexdumped:
+#                    logger.info(short_hexdump_labelled("Client->Upstream (first forwarded)", data, max_bytes=512))
+#                    self._first_client_hexdumped = True
+#                self.upstream_proto.transport.write(data)
+#                logger.debug("Forwarded %d bytes client->upstream (total forwarded: %d)", len(data), self._bytes_from_client)
+#            except Exception:
+#                logger.exception("Failed writing to upstream; closing both sides")
+#                try: self.upstream_proto.transport.loseConnection()
+#                except Exception: pass
+#                try: self.transport.loseConnection()
+#                except Exception: pass
+#            return
+
+#        # If not yet tunneled, parse the CONNECT request header
+#        self._buffer += data
+#        if b"\r\n\r\n" not in self._buffer:
+#            return
+
+#        # Parse first line
+#        try:
+#            head, rest = self._buffer.split(b"\r\n\r\n", 1)
+#            first_line, _ = head.split(b"\r\n", 1)
+#            parts = first_line.split()
+#            if len(parts) < 3:
+#                raise ValueError("Bad request line")
+#            method, hostport = parts[0], parts[1]
+#            if method != b"CONNECT":
+#                self.transport.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+#                self.transport.loseConnection()
+#                return
+#            # hostport looks like b"api.ipify.org:443"
+#            host, port_s = hostport.split(b":", 1)
+#            self._host = host.decode()
+#            self._port = int(port_s)
+#        except Exception:
+#            self.transport.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+#            self.transport.loseConnection()
+#            return
+
+#        logger.info("Proxy CONNECT to %s:%d", self._host, self._port)
+#        # Reply success and switch to tunneling mode (client will begin TLS handshake)
+#        self.transport.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+#        self._tunneled = True
+
+#        # If there was extra data beyond CONNECT headers (rare), buffer it to send to upstream
+#        if rest:
+#            self._buffered_after_connect += rest
+#            logger.debug("Buffered %d extra bytes after CONNECT headers to send to upstream", len(rest))
+
+#        # Initiate raw TCP connection to the requested upstream host:port and wire it
+#        self._start_upstream_tunnel()
+
+#        # reset header buffer
+#        self._buffer = b""
+
+#    def _start_upstream_tunnel(self):
+#        logger.debug("Starting upstream tunnel to %s:%d", self._host, self._port)
+#        ep = TCP4ClientEndpoint(reactor, self._host, self._port)
+#        upstream_proto = UpstreamProxyProtocol(self)
+#        d = connectProtocol(ep, upstream_proto)
+
+#        def _cb(proto):
+#            logger.info("Connected to upstream %s:%d", self._host, self._port)
+#            # flush any buffered bytes we captured after CONNECT
+#            if self._buffered_after_connect:
+#                try:
+#                    # log the buffered first bytes (this is often the ClientHello)
+#                    logger.info(short_hexdump_labelled("Client->Upstream (buffered sent on connect)", self._buffered_after_connect, max_bytes=512))
+#                    proto.transport.write(self._buffered_after_connect)
+#                    logger.debug("Flushed %d buffered bytes to upstream", len(self._buffered_after_connect))
+#                except Exception:
+#                    logger.exception("Error flushing buffered bytes to upstream")
+#                self._buffered_after_connect = b''
+#            return proto
+
+#        def _eb(f):
+#            logger.exception("Failed to connect to upstream %s:%d: %s", self._host, self._port, f)
+#            try: self.transport.loseConnection()
+#            except Exception: pass
+
+#        d.addCallbacks(_cb, _eb)
+
+#    def connectionLost(self, reason):
+#        logger.debug("Client connectionLost: %r", reason)
+#        try:
+#            if self.upstream_proto and getattr(self.upstream_proto, "transport", None):
+#                self.upstream_proto.transport.loseConnection()
+#        except Exception:
+#            pass
+
+# -----------------------------
+# Proxy Factory
+# -----------------------------
+class ProxyFactory(Factory):
+    def buildProtocol(self, addr):
+        return ConnectProxyProtocol()
+
+# -----------------------------
+# ALPN Selector
+# -----------------------------
+class ALPNSelector(Protocol):
+    def __init__(self):
+        self._active_proto = None
+
+    def connectionMade(self):
+        # Pick fallback first (HTTP/1.1 CONNECT handler)
+        self._active_proto = ConnectProxyProtocol()
+        self._active_proto.makeConnection(self.transport)
+
+        # Schedule ALPN negotiation check
+        reactor.callLater(0, self._choose_alpn)
+
+    def _choose_alpn(self):
+        negotiated = getattr(self.transport, "negotiatedProtocol", None)
+        if callable(negotiated):
+            negotiated = negotiated()
+        if isinstance(negotiated, bytes):
+            negotiated = negotiated.decode("utf-8")
+        logger.info("ALPN negotiated: %s", negotiated)
+        if negotiated and negotiated.startswith("h2"):
+            new_proto = H2ProxyProtocol()
+            new_proto.makeConnection(self.transport)
+            self._active_proto = new_proto
+
+    def dataReceived(self, data):
+        if self._active_proto:
+            self._active_proto.dataReceived(data)
+
+    def connectionLost(self, reason):
+        if self._active_proto:
+            self._active_proto.connectionLost(reason)
+
+    
 class MyCertificateOptions(tssl.CertificateOptions):
     def __init__(self, cert_pem, key_pem, sni_callback=None):
         super().__init__(
@@ -544,82 +1097,6 @@ class ProxyMultiplexer(Factory):
     # The factory returns an ALPN selector protocol which will pick the real app protocol
     def buildProtocol(self, addr):
         return ALPNSelector()
-
-class ALPNSelector(Protocol):
-    """
-    Application-layer protocol installed under TLS.  After the TLS handshake
-    completes ALPN will be available and we swap in the appropriate handler.
-    We schedule the ALPN check on the reactor to avoid racing with the TLS handshake.
-    """
-    def connectionMade(self):
-        # Use ConnectProxyProtocol as permanent handler
-        self._fallback = ConnectProxyProtocol()
-        self._fallback.factory = getattr(self, "factory", None)
-        self.transport.protocol = self._fallback
-        self._fallback.makeConnection(self.transport)
-
-        # negotiatedProtocol is the usual attribute Twisted sets after ALPN negotiation.
-        negotiated = None
-        try:
-            negotiated = getattr(self.transport, "negotiatedProtocol", None)
-            if callable(negotiated):
-                negotiated = negotiated()
-        except Exception:
-            negotiated = None
-
-        # if negotiated is bytes, decode
-        if isinstance(negotiated, bytes):
-            negotiated = negotiated
-
-        # Decide which protocol to swap in
-        if negotiated == b"h2":
-            proto = H2ProxyProtocol(self.transport)
-            # H2ProxyProtocol expects transport param in its ctor in your code
-        else:
-            # Use ConnectProxyProtocol as fallback (e.g. for browsers that will do CONNECT)
-            proto = self._fallback   # reuse existing fallback
-            proto.factory = getattr(self, "factory", None)
-
-        # Now swap the real protocol in
-        try:
-            # First, if fallback was installed, try to cleanly disconnect it
-            try:
-                if hasattr(self, "_fallback") and self._fallback is not None:
-                    # give fallback a chance to .connectionLost if it needs to cleanup
-                    pass
-            except Exception:
-                pass
-
-            self.transport.protocol = proto
-            if not getattr(proto, "_made_connection", False):
-            # Call makeConnection on the new protocol so it sees the transport
-                proto._made_connection = True
-                proto.makeConnection(self.transport)
-        except Exception:
-            logger.exception("Failed to swap ALPN protocol")
-            try:
-                self.transport.loseConnection()
-            except Exception:
-                pass
-
-        self._swapped = True
-
-    def dataReceived(self, data):
-        # Forward directly to the fallback
-        self._fallback.dataReceived(data)
-
-# Minimal TLSProtocolWrapper
-class TLSProtocolWrapper(TLSMemoryBIOProtocol):
-    def __init__(self, protocol, context):
-        super().__init__(protocol, context)
-        self.wrapped_protocol = protocol
-
-    def connectionMade(self):
-        self.wrapped_protocol.makeConnection(self.transport)
-        super().connectionMade()
-
-    def dataReceived(self, data):
-        self.wrapped_protocol.dataReceived(data)
 
 class DynamicContextFactory(ContextFactory):
     """
@@ -772,8 +1249,8 @@ class StreamMeta:
 class UpstreamStreamReceiver(Protocol, TimeoutMixin):
     """
     Receives data from upstream (HTTP/1.1) and immediately forwards it
-    to the H2 client using StreamMeta.
-    Fully streaming: sends data as it arrives instead of waiting for connectionLost.
+    to the H2 client using StreamMeta. Handles gzip/deflate by streaming
+    decompressed bytes when available and flushing on connectionLost.
     """
     def __init__(self, h2_protocol: "H2ProxyProtocol", stream_meta: StreamMeta, encoding: Optional[str] = None):
         self.h2_protocol = h2_protocol
@@ -781,42 +1258,97 @@ class UpstreamStreamReceiver(Protocol, TimeoutMixin):
         self.setTimeout(UPSTREAM_TIMEOUT)
         self.encoding = encoding
         self.decompressor = None
+        self._decompress_buf = b""
 
         if encoding == "gzip":
+            # gzip with header detection (windowBits = 16 + MAX_WBITS)
             self.decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
         elif encoding == "deflate":
             self.decompressor = zlib.decompressobj()
 
-    def dataReceived(self, data: bytes):
-        if not data: 
+    def _send_to_h2(self, data: bytes):
+        if not data:
             return
+        try:
+            self.h2_protocol.h2_conn.send_data(self.meta.stream_id, data)
+            self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
+            incr_bytes_out(len(data))
+        except Exception:
+            logger.exception("Failed sending data to H2 stream %d", self.meta.stream_id)
+            # if sending fails, reset the stream
+            try:
+                self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
+            except Exception:
+                pass
+
+    def dataReceived(self, data: bytes):
+        if not data:
+            return
+
         if self.decompressor:
-            data = self.decompressor.decompress(data)
-        self.h2_protocol.h2_conn.send_data(self.meta.stream_id, data)
-        self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
-        incr_bytes_out(len(data))
+            try:
+                out = self.decompressor.decompress(data)
+            except Exception:
+                logger.exception("Decompression error for stream %d", self.meta.stream_id)
+                # If decompression fails, reset stream
+                self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
+                return
+
+            if out:
+                self._send_to_h2(out)
+            # there may be buffered decompressed data available only after flush;
+            # do NOT emit end_stream here; wait for upstream close which will flush.
+        else:
+            # no decompression => send immediately
+            self._send_to_h2(data)
 
     def connectionLost(self, reason):
         """
-        Upstream closed: flush remaining data and end H2 stream.
+        Upstream closed: flush decompressor (if any), then flush any queued
+        chunks from the stream meta and finally send END_STREAM once.
         """
+        logger.debug("Upstream connectionLost for stream %d: %r", self.meta.stream_id, reason)
         self.meta.closed = True
-        # flush all remaining buffered data
+
+        # Flush decompressor if present
+        if self.decompressor:
+            try:
+                remaining = self.decompressor.flush()
+                if remaining:
+                    self._send_to_h2(remaining)
+            except Exception:
+                logger.exception("Error flushing decompressor for stream %d", self.meta.stream_id)
+                # continue to try to close stream
+
+        # Send any buffered chunks queued on StreamMeta (body we accepted from client)
         try:
-            while chunk := self.meta.pop_chunk(self.h2_protocol.max_frame_size):
+            while True:
+                chunk = self.meta.pop_chunk(self.h2_protocol.max_frame_size)
+                if not chunk:
+                    break
                 self.h2_protocol.h2_conn.send_data(self.meta.stream_id, chunk)
                 self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
                 incr_bytes_out(len(chunk))
-            # send END_STREAM
+        except Exception:
+            logger.exception("Error flushing StreamMeta buffer for stream %d", self.meta.stream_id)
+            try:
+                self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
+            except Exception:
+                pass
+
+        # Finally, ensure a single END_STREAM is sent for this H2 stream
+        try:
             self.h2_protocol.h2_conn.send_data(self.meta.stream_id, b'', end_stream=True)
             self.h2_protocol.transport.write(self.h2_protocol.h2_conn.data_to_send())
         except Exception:
-            self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
+            logger.exception("Failed to send END_STREAM for stream %d", self.meta.stream_id)
+            try:
+                self.meta.reset_stream(h2.errors.ErrorCodes.INTERNAL_ERROR)
+            except Exception:
+                pass
 
     def timeoutConnection(self):
-        """
-        Upstream timeout: cancel the stream.
-        """
+        # Upstream timeout: cancel the stream.
         if self.meta and not self.meta.closed:
             logger.warning("Upstream timeout for stream %d", self.meta.stream_id)
             self.meta.reset_stream(h2.errors.ErrorCodes.CANCEL)
@@ -974,8 +1506,8 @@ class UpstreamAgentRequest:
 # H2 protocol implementation (server-side) -- unchanged
 # ---------------------------------------------------------------------
 class H2ProxyProtocol:
-    def __init__(self, transport):
-        self.transport = transport
+    def __init__(self):
+        self.transport = None
         cfg = h2.config.H2Configuration(client_side=False, header_encoding="utf-8")
         self.h2_conn = h2.connection.H2Connection(config=cfg)
         self.stream_meta: Dict[int, StreamMeta] = {}
@@ -990,18 +1522,19 @@ class H2ProxyProtocol:
         self.agent_https = Agent(reactor, BrowserLikePolicyForHTTPS())  # HTTPS over TLS (still H1)
         self._sending_loop_active = False
 
-        # Advertise sensible settings immediately
-        try:
-            self.h2_conn.initiate_connection()
-            settings = {
-                h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: INITIAL_WINDOW_SIZE_DEFAULT,
-                h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: MAX_CONCURRENT_STREAMS_DEFAULT,
-                h2.settings.SettingCodes.MAX_FRAME_SIZE: self.max_frame_size
-            }
-            self.h2_conn.update_settings(settings)
-            # Note: data_to_send will be written by wrapper that created this instance
-        except Exception:
-            pass
+    def makeConnection(self, transport):
+        self.transport = transport
+        # Initiate HTTP/2 connection and send initial settings
+        self.h2_conn.initiate_connection()
+        settings = {
+            h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 65535,
+            h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: self.max_concurrent_streams,
+            h2.settings.SettingCodes.MAX_FRAME_SIZE: self.max_frame_size
+        }
+        self.h2_conn.update_settings(settings)
+        self.transport.write(self.h2_conn.data_to_send())
+        # Start idle timer
+        self._idle_call = reactor.callLater(60, self.on_connection_idle)
 
     # Connection idle handler
     def on_connection_idle(self):
@@ -1301,7 +1834,7 @@ class H2ProxyProtocol:
 class H2ProtocolWrapper(Protocol):
     def connectionMade(self):
         # instantiate the core protocol implementation and register
-        self.h2 = H2ProxyProtocol(self.transport)
+        self.h2 = H2ProxyProtocol()
         # set idle timer for the created H2ProxyProtocol
         try:
             self.h2._idle_call = reactor.callLater(CONNECTION_IDLE_TIMEOUT, self.h2.on_connection_idle)
@@ -1332,7 +1865,7 @@ class H2ProtocolWrapper(Protocol):
             # decide protocol (H2 vs fallback)
             negotiated = getattr(self.transport, "negotiatedProtocol", lambda: None)()
             if negotiated == b"h2":
-                self.h2_proto = H2ProxyProtocol(self.transport)
+                self.h2_proto = H2ProxyProtocol()
             else:
                 # fallback for plain HTTP/1.1 CONNECT
                 self.h2_proto = ConnectProxyProtocol()
